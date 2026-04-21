@@ -8,7 +8,7 @@ from uuid import uuid4
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import *
 
-TOKEN = "8779339832:AAEVc-vTgxPzDEUNG6vDDecka4QVxOelMfw"
+TOKEN = "YOUR_TOKEN_HERE"
 
 logging.basicConfig(level=logging.INFO)
 
