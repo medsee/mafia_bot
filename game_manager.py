@@ -1,133 +1,113 @@
-"""
-game_manager.py — State-machine core for a single Mafia game instance.
-
-Manages: lobby → night → day → voting → [night...] → ended
-
-One GameManager per chat. GameRegistry holds them all.
-"""
+"""game_manager.py — Full state machine: Lobby→Night→Day→Voting→Defense→loop→End."""
 from __future__ import annotations
-
 import asyncio
 import logging
 import random
 import uuid
-from datetime import datetime
 from typing import Optional, Callable, Awaitable
 
 from ai_engine import AIEngine
+from config import cfg, t
+from keyboards import (
+    day_control_keyboard, lobby_keyboard, night_action_keyboard,
+    vote_keyboard, last_will_keyboard
+)
 from models import (
-    NightResult, Phase, Player, Role, NightAction,
-    assign_roles
+    NightResult, Phase, Player, Role, assign_roles, ACHIEVEMENTS
 )
 from role_engine import RoleEngine
 
 logger = logging.getLogger(__name__)
 
-# Timing constants (seconds)
-LOBBY_TIMEOUT        = 120   # auto-start if enough players after this
-NIGHT_ACTION_TIMEOUT = 45    # how long night phase lasts
-DAY_SPEECH_TIMEOUT   = 60    # how long day discussion lasts
-VOTING_TIMEOUT       = 40    # how long voting lasts
+SendFn = Callable[..., Awaitable[None]]
 
-AI_NAMES = [
-    "Alice", "Bob", "Carlos", "Diana", "Erik",
-    "Fatima", "George", "Hana", "Ivan", "Julia"
-]
+AI_NAMES = ["Alice", "Bob", "Carlos", "Diana", "Erik",
+            "Fatima", "George", "Hana", "Ivan", "Julia",
+            "Kevin", "Luna", "Marco", "Nina", "Omar"]
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Vote tracker (anti-spam)
-# ──────────────────────────────────────────────────────────────────────────────
 
 class VoteTracker:
-    """Allows each player to cast exactly one vote per voting phase.
-    Supports vote changing (last vote wins)."""
+    def __init__(self, weighted: bool = False):
+        self._votes: dict[int, int] = {}
+        self._weights: dict[int, int] = {}  # voter -> weight
+        self.weighted = weighted
 
-    def __init__(self) -> None:
-        self._votes: dict[int, int] = {}  # voter_id -> target_id
+    def set_weight(self, voter_id: int, weight: int):
+        self._weights[voter_id] = weight
 
     def cast(self, voter_id: int, target_id: int) -> bool:
-        """Returns True if this is a new vote, False if changed."""
         is_new = voter_id not in self._votes
         self._votes[voter_id] = target_id
         return is_new
 
-    def has_voted(self, voter_id: int) -> bool:
-        return voter_id in self._votes
-
     def get_previous(self, voter_id: int) -> Optional[int]:
         return self._votes.get(voter_id)
 
-    def tally(self) -> dict[int, int]:
-        """Returns {target_id: vote_count}."""
-        tally: dict[int, int] = {}
-        for target in self._votes.values():
-            tally[target] = tally.get(target, 0) + 1
-        return tally
+    def has_voted(self, voter_id: int) -> bool:
+        return voter_id in self._votes
 
-    def leading(self) -> Optional[int]:
-        t = self.tally()
-        if not t:
-            return None
-        return max(t, key=lambda k: t[k])
+    def tally(self) -> dict[int, int]:
+        tally: dict[int, int] = {}
+        for voter, target in self._votes.items():
+            weight = self._weights.get(voter, 1)
+            tally[target] = tally.get(target, 0) + weight
+        return tally
 
     def voter_count(self) -> int:
         return len(self._votes)
 
-    def all_votes(self) -> dict[int, int]:
-        return dict(self._votes)
-
-    def reset(self) -> None:
+    def reset(self):
         self._votes.clear()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# GameManager
-# ──────────────────────────────────────────────────────────────────────────────
-
-# Callback type: async fn(chat_id, text, **kwargs)
-SendFn = Callable[..., Awaitable[None]]
+        self._weights.clear()
 
 
 class GameManager:
-    def __init__(self, chat_id: int, send_fn: SendFn, db) -> None:
-        self.chat_id      = chat_id
-        self.game_id      = str(uuid.uuid4())[:8]
-        self.send         = send_fn   # injected messaging function
-        self.db           = db
+    def __init__(self, chat_id: int, send_fn: SendFn, db, lang: str = "uz"):
+        self.chat_id       = chat_id
+        self.game_id       = str(uuid.uuid4())[:8].upper()
+        self.send          = send_fn
+        self.db            = db
+        self.lang          = lang
 
-        self.phase        = Phase.LOBBY
-        self.players:     dict[int, Player] = {}
-        self.round        = 0
-        self.started_at   = datetime.utcnow()
+        self.phase         = Phase.LOBBY
+        self.players:      dict[int, Player] = {}
+        self.round         = 0
+        self.host_id:      Optional[int] = None
 
-        self.vote_tracker = VoteTracker()
+        self.vote_tracker  = VoteTracker(weighted=True)
         self.night_result: Optional[NightResult] = None
 
-        # Accumulated knowledge for AI
-        self._known_roles:   dict[int, Role] = {}   # detective-revealed
-        self._vote_history:  dict[int, list[int]] = {}  # user_id -> list of vote targets
-        self._all_kills:     list[int] = []          # accumulates all night kills
+        # Knowledge
+        self._known_roles:   dict[int, Role] = {}
+        self._vote_history:  dict[int, list[int]] = {}
+        self._all_kills:     list[int] = []
+        self._game_log:      list[dict] = []
 
-        # Phase timers
-        self._phase_task:    Optional[asyncio.Task] = None
+        # Mafia chat (user_ids of human mafia)
+        self._mafia_chat_members: list[int] = []
+        # Ghost chat (dead human players)
+        self._ghost_members: list[int] = []
 
-        # Lobby host (first joiner)
-        self.host_id: Optional[int] = None
+        # Phase control
+        self._phase_task:  Optional[asyncio.Task] = None
+        self._defense_target: Optional[int] = None
 
-    # ──────────────────────────────────────────
-    # Lobby management
-    # ──────────────────────────────────────────
+        # Anonymous voting option
+        self.anonymous_vote = False
+
+        # Day 1 protection flag
+        self._first_night_done = False
+
+    # ═══════════════════════════════════════════════════════════════
+    # Lobby
+    # ═══════════════════════════════════════════════════════════════
 
     def join(self, user_id: int, name: str) -> bool:
-        """Returns True if joined, False if already in game."""
-        if user_id in self.players:
+        if (user_id in self.players or
+                len(self.players) >= cfg.MAX_PLAYERS or
+                self.phase != Phase.LOBBY):
             return False
-        if len(self.players) >= 10:
-            return False
-        if self.phase != Phase.LOBBY:
-            return False
-        self.players[user_id] = Player(user_id=user_id, name=name)
+        self.players[user_id] = Player(user_id=user_id, name=name, lang=self.lang)
         if self.host_id is None:
             self.host_id = user_id
         return True
@@ -141,17 +121,15 @@ class GameManager:
         return True
 
     def add_ai_player(self) -> bool:
-        existing_ai = sum(1 for p in self.players.values() if p.is_ai)
-        if existing_ai >= 6 or len(self.players) >= 10:
+        ai_count = sum(1 for p in self.players.values() if p.is_ai)
+        if ai_count >= cfg.MAX_AI or len(self.players) >= cfg.MAX_PLAYERS:
             return False
-        ai_name = next(
-            (n for n in AI_NAMES
-             if n not in {p.name for p in self.players.values()}),
-            f"Bot{random.randint(100,999)}"
+        name = next(
+            (n for n in AI_NAMES if n not in {p.name for p in self.players.values()}),
+            f"Bot{random.randint(100, 999)}"
         )
-        ai_id = -(1000 + existing_ai)  # negative IDs for AI
-        p = Player(user_id=ai_id, name=ai_name, is_ai=True)
-        self.players[ai_id] = p
+        ai_id = -(1000 + ai_count)
+        self.players[ai_id] = Player(user_id=ai_id, name=name, is_ai=True, lang=self.lang)
         return True
 
     def player_count(self) -> int:
@@ -160,123 +138,115 @@ class GameManager:
     def alive_players(self) -> list[Player]:
         return [p for p in self.players.values() if p.is_alive]
 
-    def alive_human_players(self) -> list[Player]:
-        return [p for p in self.players.values() if p.is_alive and not p.is_ai]
+    def get_player(self, user_id: int) -> Optional[Player]:
+        return self.players.get(user_id)
 
-    # ──────────────────────────────────────────
-    # Game start
-    # ──────────────────────────────────────────
+    def is_ended(self) -> bool:
+        return self.phase == Phase.ENDED
+
+    # ═══════════════════════════════════════════════════════════════
+    # Start
+    # ═══════════════════════════════════════════════════════════════
 
     async def start_game(self) -> None:
         if self.phase != Phase.LOBBY:
             return
-        if len(self.players) < 4:
-            await self.send(self.chat_id, "❌ Need at least 4 players to start!")
+        if len(self.players) < cfg.MIN_PLAYERS:
+            await self.send(self.chat_id, t(self.lang, "need_players"))
             return
 
         assign_roles(list(self.players.values()))
         self.phase = Phase.NIGHT
-        await self.db.start_game(self.game_id, self.chat_id, len(self.players))
+
+        # Set Mayor vote weights
+        for p in self.players.values():
+            if p.role == Role.MAYOR:
+                self.vote_tracker.set_weight(p.user_id, 2)
+
+        # Identify mafia chat members
+        self._mafia_chat_members = [
+            uid for uid, p in self.players.items()
+            if p.role == Role.MAFIA and not p.is_ai
+        ]
+
+        await self.db.start_game(self.game_id, self.chat_id, len(self.players), self.lang)
+        self._log("game_start", f"Game started with {len(self.players)} players")
 
         await self.send(
             self.chat_id,
-            f"🎭 <b>Game #{self.game_id} begins!</b>\n"
-            f"👥 {len(self.players)} players — roles have been assigned.\n"
-            f"Check your private messages for your role!\n\n"
-            f"<i>🌙 Night falls... The city sleeps.</i>"
+            t(self.lang, "game_started", gid=self.game_id, n=len(self.players))
         )
-
         await self._begin_night()
 
-    # ──────────────────────────────────────────
-    # Night phase
-    # ──────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════
+    # Night
+    # ═══════════════════════════════════════════════════════════════
 
     async def _begin_night(self) -> None:
         self.phase = Phase.NIGHT
         self.round += 1
         await self.db.increment_round(self.game_id)
 
-        # Reset night state for all alive players
         for p in self.players.values():
             p.reset_night_state()
 
-        await self.send(
-            self.chat_id,
-            f"🌙 <b>Night {self.round}</b>\n"
-            "The city falls silent. Special roles, check your DMs."
-        )
+        await self.send(self.chat_id, t(self.lang, "night_begins", n=self.round))
 
-        # Process AI night actions
+        # Day 1: no kills (only detective/doctor act)
+        # (handled by resolve — first night kills still happen but we let it go)
+
         await self._process_ai_night_actions()
-
-        # Start timeout for human players
         self._cancel_phase_task()
         self._phase_task = asyncio.create_task(self._night_timeout())
 
     async def _night_timeout(self) -> None:
-        await asyncio.sleep(NIGHT_ACTION_TIMEOUT)
+        await asyncio.sleep(cfg.NIGHT_TIMEOUT)
         await self._resolve_night()
 
     async def _process_ai_night_actions(self) -> None:
-        """AI players act immediately (with slight artificial delay)."""
         for uid, player in self.players.items():
-            if not player.is_alive or not player.is_ai:
+            if not player.is_alive or not player.is_ai or not player.role.has_night_action:
                 continue
-            if not player.role.has_night_action:
-                continue
-
-            await asyncio.sleep(random.uniform(1.5, 4.0))  # realistic delay
-
+            await asyncio.sleep(random.uniform(2.0, 5.0))
             target = AIEngine.choose_night_target(
-                actor=player,
-                all_players=self.players,
-                known_roles=self._known_roles,
-                vote_history=self._vote_history,
+                player, self.players, self._known_roles, self._vote_history
             )
             if target is not None:
                 player.night_target = target
                 player.has_acted = True
-                logger.debug("AI %s (%s) targets %s", player.name, player.role, target)
 
     async def record_night_action(self, actor_id: int, target_id: int) -> str:
-        """Called when a human player DMs their night action. Returns feedback."""
         if self.phase != Phase.NIGHT:
-            return "❌ It's not night phase."
-        if actor_id not in self.players:
-            return "❌ You are not in this game."
-
-        actor = self.players[actor_id]
-        if not actor.is_alive:
-            return "❌ You are dead."
+            return "❌ Kecha fazasi emas."
+        actor = self.players.get(actor_id)
+        if not actor or not actor.is_alive:
+            return "❌ Siz bu o'yinda yo'q yoki o'lgansiz."
         if not actor.role.has_night_action:
-            return "❌ Your role has no night action."
+            return "❌ Sizning rolingizda kecha harakati yo'q."
         if actor.role == Role.SNIPER and actor.sniper_used:
-            return "❌ You've already used your sniper shot."
-        if target_id not in self.players:
-            return "❌ Invalid target."
-        if target_id == actor_id:
-            if actor.role != Role.DOCTOR:
-                return "❌ You can't target yourself."
-        target = self.players[target_id]
-        if not target.is_alive:
-            return "❌ That player is already dead."
+            return "❌ Siz allaqachon o'q ishlatdingiz."
+        target = self.players.get(target_id)
+        if not target or not target.is_alive:
+            return "❌ Noto'g'ri yoki o'lgan nishon."
+        if target_id == actor_id and actor.role != Role.DOCTOR:
+            return "❌ O'zingizni nishon qila olmaysiz."
 
         actor.night_target = target_id
-        actor.has_acted = True
+        actor.has_acted    = True
 
-        # Auto-resolve if all role-players have acted
         if self._all_active_roles_acted():
             self._cancel_phase_task()
             asyncio.create_task(self._resolve_night())
 
-        return f"✅ Action recorded on <b>{target.name}</b>."
+        return t(self.lang, "action_recorded", name=target.name)
 
     def _all_active_roles_acted(self) -> bool:
         for p in self.players.values():
-            if p.is_alive and p.role.has_night_action and not p.has_acted:
-                if p.role == Role.SNIPER and p.sniper_used:
-                    continue  # sniper already spent shot
+            if not p.is_alive or not p.role.has_night_action:
+                continue
+            if p.role == Role.SNIPER and p.sniper_used:
+                continue
+            if not p.has_acted:
                 return False
         return True
 
@@ -287,104 +257,146 @@ class GameManager:
         result = RoleEngine.resolve_night(self.players)
         self.night_result = result
         self._all_kills.extend(result.killed + result.sniped)
-
-        # Update known roles from detective work
         self._known_roles.update(result.inspected)
 
-        # Announce night results
-        lines = ["☀️ <b>Dawn breaks...</b>\n"]
+        lines = [t(self.lang, "dawn"), ""]
 
-        if not result.killed and not result.sniped:
-            lines.append("🕊️ The night was peaceful — nobody died!")
+        if not result.killed and not result.sniped and not result.bg_died:
+            lines.append(t(self.lang, "nobody_died"))
         else:
             for uid in result.killed:
                 p = self.players[uid]
-                lines.append(f"💀 <b>{p.name}</b> was found dead. They were the <b>{p.role.display_name} {p.role.emoji}</b>")
+                lines.append(t(self.lang, "player_killed",
+                                name=p.name, role=p.role.display_name, emoji=p.role.emoji))
+                # Last will
+                will = p.last_will or await self.db.get_last_will(uid) if uid > 0 else ""
+                if will:
+                    lines.append(t(self.lang, "last_will", name=p.name, will=will))
+                # Add to ghost chat
+                if not p.is_ai:
+                    self._ghost_members.append(uid)
+
             for uid in result.sniped:
                 p = self.players[uid]
-                lines.append(f"🎯 <b>{p.name}</b> was eliminated by a Sniper. They were the <b>{p.role.display_name} {p.role.emoji}</b>")
+                lines.append(t(self.lang, "player_sniped",
+                                name=p.name, role=p.role.display_name, emoji=p.role.emoji))
+                if not p.is_ai:
+                    self._ghost_members.append(uid)
 
-        lines.extend(result.messages)
+            for bg_id, target_id in result.bg_died:
+                bg = self.players[bg_id]
+                target = self.players[target_id]
+                lines.append(t(self.lang, "bodyguard_died",
+                                guard=bg.name, target=target.name))
+                if not bg.is_ai:
+                    self._ghost_members.append(bg_id)
+
+        # Check lover deaths
+        for uid in result.killed:
+            p = self.players[uid]
+            if p.lover_id and p.lover_id in self.players:
+                lover = self.players[p.lover_id]
+                if not lover.is_alive and p.lover_id not in result.killed:
+                    lines.append(t(self.lang, "lover_died", name=lover.name))
+
+        if "doctor_saved" in result.messages:
+            lines.append(t(self.lang, "doctor_saved"))
 
         await self.send(self.chat_id, "\n".join(lines))
 
-        # Notify detectives of their findings (private)
+        # Detective DM results
         for t_id, role in result.inspected.items():
             detective = next(
                 (p for p in self.players.values()
-                 if p.is_alive and p.role == Role.DETECTIVE and p.night_target == t_id),
+                 if p.is_alive and p.role == Role.DETECTIVE and p.night_target == t_id and not p.is_ai),
                 None
             )
-            if detective and not detective.is_ai:
+            if detective:
                 await self.send(
                     detective.user_id,
-                    f"🔍 Investigation complete: <b>{self.players[t_id].name}</b> "
-                    f"is a <b>{role.display_name} {role.emoji}</b>"
+                    f"🔍 <b>{self.players[t_id].name}</b> — <b>{role.display_name}</b> {role.emoji}"
                 )
 
-        # Check win condition
+        self._log("night_end", f"Round {self.round}: killed={result.killed}, sniped={result.sniped}")
+
         winner = RoleEngine.check_win(self.players)
         if winner:
             await self._end_game(winner)
-            return
+        else:
+            await self._begin_day()
 
-        await self._begin_day()
-
-    # ──────────────────────────────────────────
-    # Day phase
-    # ──────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════
+    # Day
+    # ═══════════════════════════════════════════════════════════════
 
     async def _begin_day(self) -> None:
         self.phase = Phase.DAY
 
         alive_list = "\n".join(
-            f"  {'💀' if not p.is_alive else '✅'} {p.mention}"
+            f"  {'✅' if p.is_alive else '💀'} {p.mention}"
             for p in self.players.values()
         )
+
+        # AI bluff messages
+        asyncio.create_task(self._ai_day_chat())
+
         await self.send(
             self.chat_id,
-            f"☀️ <b>Day {self.round}</b> — Discussion time!\n\n"
-            f"<b>Alive players ({len(self.alive_players())}):</b>\n{alive_list}\n\n"
-            f"🗣️ Discuss for {DAY_SPEECH_TIMEOUT}s, then voting begins!"
+            t(self.lang, "day_phase",
+              n=self.round, alive=len(self.alive_players()),
+              list=alive_list, sec=cfg.DAY_TIMEOUT),
+            reply_markup_chat=day_control_keyboard(is_host=True)
         )
 
         self._cancel_phase_task()
         self._phase_task = asyncio.create_task(self._day_timeout())
 
+    async def _ai_day_chat(self) -> None:
+        """AI players send bluff messages during day discussion."""
+        alive_ai = [p for p in self.players.values() if p.is_alive and p.is_ai]
+        for ai in alive_ai:
+            await asyncio.sleep(random.uniform(5, 20))
+            if self.phase != Phase.DAY:
+                break
+            msg = AIEngine.get_bluff_message(ai, self.players)
+            if msg:
+                await self.send(self.chat_id, f"🤖 <b>{ai.name}:</b> {msg}")
+
     async def _day_timeout(self) -> None:
-        await asyncio.sleep(DAY_SPEECH_TIMEOUT)
+        await asyncio.sleep(cfg.DAY_TIMEOUT)
         await self._begin_voting()
 
     async def skip_to_vote(self, user_id: int) -> str:
-        """Host can skip day phase."""
         if user_id != self.host_id:
-            return "❌ Only the host can skip."
+            return t(self.lang, "not_host")
         if self.phase != Phase.DAY:
-            return "❌ Not in day phase."
+            return "❌ Kun fazasi emas."
         self._cancel_phase_task()
         asyncio.create_task(self._begin_voting())
-        return "⏩ Skipping to vote!"
+        return "⏩ Ovoz berishga o'tilmoqda!"
 
-    # ──────────────────────────────────────────
-    # Voting phase
-    # ──────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════
+    # Voting
+    # ═══════════════════════════════════════════════════════════════
 
     async def _begin_voting(self) -> None:
         self.phase = Phase.VOTING
         self.vote_tracker.reset()
 
+        # Reset mayor weights
+        for p in self.players.values():
+            if p.role == Role.MAYOR and p.is_revealed:
+                self.vote_tracker.set_weight(p.user_id, 2)
+
         alive = self.alive_players()
         await self.send(
             self.chat_id,
-            f"🗳️ <b>Voting phase!</b>\n"
-            f"Vote to eliminate a player.\n"
-            f"⏱️ You have {VOTING_TIMEOUT} seconds.",
-            vote_targets=[(p.user_id, p.name) for p in alive]
+            t(self.lang, "voting_phase", sec=cfg.VOTING_TIMEOUT),
+            vote_targets=[(p.user_id, p.mention) for p in alive],
+            anonymous=self.anonymous_vote
         )
 
-        # AI votes
         await self._process_ai_votes()
-
         self._cancel_phase_task()
         self._phase_task = asyncio.create_task(self._voting_timeout())
 
@@ -392,48 +404,38 @@ class GameManager:
         for uid, player in self.players.items():
             if not player.is_alive or not player.is_ai:
                 continue
-            await asyncio.sleep(random.uniform(1.0, 3.0))
+            await asyncio.sleep(random.uniform(1.0, 4.0))
+            if self.phase != Phase.VOTING:
+                break
             target = AIEngine.choose_vote_target(
-                voter=player,
-                all_players=self.players,
-                known_roles=self._known_roles,
-                vote_history=self._vote_history,
-                night_kills=self._all_kills,
+                player, self.players, self._known_roles,
+                self._vote_history, self._all_kills
             )
             if target and target in self.players:
-                self._cast_vote_internal(uid, target)
+                self.vote_tracker.cast(uid, target)
+                self._vote_history.setdefault(uid, []).append(target)
 
     def cast_vote(self, voter_id: int, target_id: int) -> str:
-        """Human player casts a vote. Returns feedback string."""
         if self.phase != Phase.VOTING:
-            return "❌ Voting is not active."
-        if voter_id not in self.players:
-            return "❌ You are not in this game."
-        voter = self.players[voter_id]
-        if not voter.is_alive:
-            return "❌ Dead players cannot vote."
-        if target_id not in self.players:
-            return "❌ Invalid target."
+            return "❌ Ovoz berish faol emas."
+        voter = self.players.get(voter_id)
+        if not voter or not voter.is_alive:
+            return "❌ Siz ovoz bera olmaysiz."
+        target = self.players.get(target_id)
+        if not target or not target.is_alive:
+            return "❌ Noto'g'ri nishon."
         if target_id == voter_id:
-            return "❌ You cannot vote for yourself."
-        if not self.players[target_id].is_alive:
-            return "❌ That player is already dead."
-
+            return "❌ O'zingizga ovoz bera olmaysiz."
         prev = self.vote_tracker.get_previous(voter_id)
-        self._cast_vote_internal(voter_id, target_id)
-
-        if prev and prev != target_id:
-            return (f"🔄 Changed vote: <b>{self.players[prev].name}</b> → "
-                    f"<b>{self.players[target_id].name}</b>")
-        return f"✅ Voted for <b>{self.players[target_id].name}</b>"
-
-    def _cast_vote_internal(self, voter_id: int, target_id: int) -> None:
         self.vote_tracker.cast(voter_id, target_id)
-        # Record vote history for AI knowledge
         self._vote_history.setdefault(voter_id, []).append(target_id)
+        if prev and prev != target_id:
+            prev_name = self.players.get(prev, Player(-1, "?")).name
+            return f"🔄 Ovoz o'zgartirildi: <b>{prev_name}</b> → <b>{target.name}</b>"
+        return f"✅ <b>{target.name}</b> ga ovoz berildi"
 
     async def _voting_timeout(self) -> None:
-        await asyncio.sleep(VOTING_TIMEOUT)
+        await asyncio.sleep(cfg.VOTING_TIMEOUT)
         await self._resolve_vote()
 
     async def _resolve_vote(self) -> None:
@@ -442,38 +444,86 @@ class GameManager:
 
         tally = self.vote_tracker.tally()
         if not tally:
-            await self.send(self.chat_id, "🤷 No votes were cast. Nobody is eliminated.")
+            await self.send(self.chat_id, t(self.lang, "no_votes"))
             await self._check_and_continue()
             return
 
-        # Build result string
-        tally_lines = []
-        for uid, count in sorted(tally.items(), key=lambda x: -x[1]):
-            tally_lines.append(f"  {self.players[uid].name}: {count} vote(s)")
+        # Build tally display
+        tally_lines = [
+            f"  {self.players[uid].mention}: {v} ovoz"
+            for uid, v in sorted(tally.items(), key=lambda x: -x[1])
+            if uid in self.players
+        ]
 
         max_votes = max(tally.values())
-        leaders = [uid for uid, v in tally.items() if v == max_votes]
+        leaders = [uid for uid, v in tally.items() if v == max_votes and uid in self.players]
 
         if len(leaders) > 1:
-            # Tie — no elimination
-            tied_names = ", ".join(self.players[uid].name for uid in leaders)
-            await self.send(
-                self.chat_id,
-                f"📊 <b>Vote results:</b>\n" + "\n".join(tally_lines) +
-                f"\n\n⚖️ <b>Tie between {tied_names}!</b> Nobody is eliminated."
-            )
-        else:
-            eliminated_id = leaders[0]
-            eliminated = self.players[eliminated_id]
-            eliminated.is_alive = False
+            names = ", ".join(self.players[uid].name for uid in leaders)
+            await self.send(self.chat_id,
+                f"📊 <b>Ovozlar:</b>\n" + "\n".join(tally_lines) +
+                "\n\n" + t(self.lang, "tie_vote", names=names))
+            await self._check_and_continue()
+            return
 
-            await self.send(
-                self.chat_id,
-                f"📊 <b>Vote results:</b>\n" + "\n".join(tally_lines) +
-                f"\n\n🪓 The town voted to eliminate <b>{eliminated.name}</b>.\n"
-                f"They were the <b>{eliminated.role.display_name} {eliminated.role.emoji}</b>!"
-            )
+        condemned_id = leaders[0]
+        condemned = self.players[condemned_id]
 
+        # Check Jester win
+        if condemned.role == Role.JESTER:
+            condemned.is_alive = False
+            await self.send(self.chat_id,
+                f"📊 <b>Ovozlar:</b>\n" + "\n".join(tally_lines) +
+                "\n\n" + t(self.lang, "jester_wins", name=condemned.name))
+            self._log("jester_win", condemned.name)
+            await self._end_game("jester")
+            return
+
+        # Defense speech phase
+        self._defense_target = condemned_id
+        self.phase = Phase.DEFENSE
+
+        await self.send(self.chat_id,
+            f"📊 <b>Ovozlar:</b>\n" + "\n".join(tally_lines) +
+            "\n\n" + t(self.lang, "defense_speech",
+                       name=condemned.name, sec=cfg.DEFENSE_TIMEOUT))
+
+        self._cancel_phase_task()
+        self._phase_task = asyncio.create_task(self._defense_timeout(condemned_id))
+
+    async def _defense_timeout(self, condemned_id: int) -> None:
+        await asyncio.sleep(cfg.DEFENSE_TIMEOUT)
+        await self._execute_player(condemned_id)
+
+    async def _execute_player(self, player_id: int) -> None:
+        if self.phase not in (Phase.DEFENSE, Phase.VOTING):
+            return
+        player = self.players.get(player_id)
+        if not player:
+            return
+
+        player.is_alive = False
+        if not player.is_ai:
+            self._ghost_members.append(player_id)
+
+        will = player.last_will or (await self.db.get_last_will(player_id) if player_id > 0 else "")
+
+        msg = t(self.lang, "eliminated",
+                name=player.name, role=player.role.display_name, emoji=player.role.emoji)
+        if will:
+            msg += "\n\n" + t(self.lang, "last_will", name=player.name, will=will)
+
+        # Lover death
+        if player.lover_id and player.lover_id in self.players:
+            lover = self.players[player.lover_id]
+            if lover.is_alive:
+                lover.is_alive = False
+                msg += "\n\n" + t(self.lang, "lover_died", name=lover.name)
+                if not lover.is_ai:
+                    self._ghost_members.append(player.lover_id)
+
+        await self.send(self.chat_id, msg)
+        self._log("eliminated", f"{player.name} ({player.role.value})")
         await self._check_and_continue()
 
     async def _check_and_continue(self) -> None:
@@ -483,126 +533,177 @@ class GameManager:
         else:
             await self._begin_night()
 
-    # ──────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════
+    # Mafia & Ghost Chat
+    # ═══════════════════════════════════════════════════════════════
+
+    async def relay_mafia_chat(self, sender_id: int, text: str) -> bool:
+        """Relay message to all human mafia members. Returns True if sent."""
+        if sender_id not in self._mafia_chat_members:
+            return False
+        sender = self.players.get(sender_id)
+        if not sender:
+            return False
+        for uid in self._mafia_chat_members:
+            if uid != sender_id:
+                await self.send(uid, t(self.lang, "mafia_chat", msg=f"{sender.name}: {text}"))
+        return True
+
+    async def relay_ghost_chat(self, sender_id: int, text: str) -> bool:
+        """Relay message to all dead human players."""
+        if sender_id not in self._ghost_members:
+            return False
+        sender = self.players.get(sender_id)
+        if not sender:
+            return False
+        for uid in self._ghost_members:
+            if uid != sender_id:
+                await self.send(uid, t(self.lang, "ghost_chat", name=sender.name, msg=text))
+        return True
+
+    # ═══════════════════════════════════════════════════════════════
+    # Mayor reveal
+    # ═══════════════════════════════════════════════════════════════
+
+    async def mayor_reveal(self, user_id: int) -> str:
+        player = self.players.get(user_id)
+        if not player or player.role != Role.MAYOR:
+            return "❌ Siz Mayor emassiz."
+        if player.is_revealed:
+            return "❌ Siz allaqachon oshkor qilgansiz."
+        player.is_revealed = True
+        self.vote_tracker.set_weight(user_id, 2)
+        await self.send(self.chat_id,
+            f"👑 <b>{player.name}</b> o'zini MAYOR ekanini oshkor qildi! "
+            f"Uning ovozi IKKI HISOB bo'ladi!")
+        return "✅ Oshkor qildingiz!"
+
+    # ═══════════════════════════════════════════════════════════════
     # End game
-    # ──────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════
 
     async def _end_game(self, winner: str) -> None:
         self.phase = Phase.ENDED
         self._cancel_phase_task()
 
-        winner_emoji = {"town": "🏙️", "mafia": "🔫", "maniac": "🔪", "draw": "⚖️"}.get(winner, "🎭")
-        winner_text  = {"town": "The Town wins!", "mafia": "The Mafia wins!",
-                        "maniac": "The Maniac wins!", "draw": "It's a draw!"}.get(winner, winner)
+        winner_emoji = {
+            "town": "🏙️", "mafia": "🔫", "solo": "🔪",
+            "jester": "🤡", "draw": "⚖️"
+        }.get(winner, "🎭")
 
-        # Build final role reveal
-        reveal_lines = []
-        for p in self.players.values():
-            status = "✅ Survived" if p.is_alive else "💀 Eliminated"
-            reveal_lines.append(f"  {p.role.emoji} <b>{p.name}</b> — {p.role.display_name} [{status}]")
+        winner_text_key = {
+            "town": "win_town", "mafia": "win_mafia",
+            "solo": "win_maniac", "jester": "win_jester", "draw": "win_draw"
+        }.get(winner, "win_town")
+
+        reveal = "\n".join(
+            f"  {p.role.emoji} <b>{p.name}</b> — {p.role.display_name} "
+            f"[{'✅' if p.is_alive else '💀'}]"
+            for p in self.players.values()
+        )
 
         await self.send(
             self.chat_id,
-            f"{winner_emoji} <b>GAME OVER!</b>\n"
-            f"<b>{winner_text}</b>\n\n"
-            f"<b>Final roles:</b>\n" + "\n".join(reveal_lines) +
-            f"\n\n📊 Game lasted {self.round} round(s).\n"
-            f"Use /stats to see updated statistics!"
+            t(self.lang, "game_over",
+              emoji=winner_emoji,
+              winner=t(self.lang, winner_text_key),
+              roles=reveal,
+              rounds=self.round)
         )
 
-        # Persist results
+        # Persist
         player_data = [
-            {
-                "user_id": p.user_id,
-                "name": p.name,
-                "role": p.role.value,
-                "survived": p.is_alive,
-                "is_ai": p.is_ai,
-            }
+            {"user_id": p.user_id, "name": p.name, "role": p.role.value,
+             "survived": p.is_alive, "is_ai": p.is_ai}
             for p in self.players.values()
         ]
-        await self.db.end_game(self.game_id, winner, self.round, player_data)
+        self._log("game_end", f"Winner: {winner}")
+        await self.db.end_game(self.game_id, winner, self.round, player_data, self._game_log)
 
-        # Record individual stats
+        # Update stats for human players
+        elos = [1000]
         for p in self.players.values():
-            if p.is_ai:
-                continue
-            team = p.role.team
-            won = (
-                (winner == "town" and team == "town") or
-                (winner == "mafia" and team == "mafia") or
-                (winner == "maniac" and team == "maniac")
-            )
-            await self.db.record_game_result(
-                user_id=p.user_id,
-                username=p.name,
-                role=p.role.value,
-                won=won,
-                survived=p.is_alive,
-            )
+            if p.user_id > 0:
+                stats = await self.db.get_player_stats(p.user_id)
+                if stats:
+                    elos.append(stats["elo"])
+        avg_elo = sum(elos) // len(elos)
 
-    # ──────────────────────────────────────────
+        for p in self.players.values():
+            if p.is_ai or p.user_id < 0:
+                continue
+            won = (
+                (winner == "town"   and p.role.team == "town") or
+                (winner == "mafia"  and p.role.team == "mafia") or
+                (winner == "solo"   and p.role.team == "solo") or
+                (winner == "jester" and p.role == Role.JESTER)
+            )
+            result = await self.db.record_game_result(
+                p.user_id, p.name, p.role.value, won, p.is_alive, avg_elo
+            )
+            # Notify player of ELO change and new achievements
+            elo_sign = "+" if result["elo_change"] >= 0 else ""
+            notif = f"📊 ELO: <b>{result['new_elo']}</b> ({elo_sign}{result['elo_change']})"
+            if result["new_achievements"]:
+                ach_names = ", ".join(
+                    f"{ACHIEVEMENTS[k].emoji} {ACHIEVEMENTS[k].name}"
+                    for k in result["new_achievements"]
+                    if k in ACHIEVEMENTS
+                )
+                notif += f"\n🏅 Yangi yutuq: <b>{ach_names}</b>!"
+            try:
+                await self.send(p.user_id, notif)
+            except Exception:
+                pass
+
+    # ═══════════════════════════════════════════════════════════════
     # Utility
-    # ──────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════
 
     def _cancel_phase_task(self) -> None:
         if self._phase_task and not self._phase_task.done():
             self._phase_task.cancel()
         self._phase_task = None
 
-    def is_ended(self) -> bool:
-        return self.phase == Phase.ENDED
-
-    def get_player(self, user_id: int) -> Optional[Player]:
-        return self.players.get(user_id)
+    def _log(self, event: str, detail: str = "") -> None:
+        from datetime import datetime
+        self._game_log.append({
+            "t": datetime.utcnow().isoformat()[:19],
+            "e": event,
+            "d": detail,
+            "r": self.round,
+        })
 
     def role_info(self, user_id: int) -> str:
         p = self.players.get(user_id)
         if not p:
-            return "You are not in this game."
-        lines = [f"{p.role.emoji} <b>You are the {p.role.display_name}!</b>\n"]
-
-        role_desc = {
-            Role.CIVILIAN:
-                "You have no special ability. Use your wits to identify and vote out the Mafia!",
-            Role.MAFIA:
-                "Each night, coordinate with fellow Mafia to eliminate a town member.",
-            Role.DOCTOR:
-                "Each night, protect one player from death (can self-heal once in a row).",
-            Role.DETECTIVE:
-                "Each night, investigate one player to learn their true role.",
-            Role.SNIPER:
-                "You have ONE bullet. Use it wisely to eliminate a confirmed threat.",
-            Role.MANIAC:
-                "You win ALONE. Kill at night. Survive until you're the last one standing.",
-        }
-        lines.append(role_desc.get(p.role, ""))
-
-        # Show mafia teammates
+            return "Siz bu o'yinda yo'qsiz."
+        lang = p.lang
+        desc = p.role.description(lang)
+        lines = [t(lang, "your_role", emoji=p.role.emoji, role=p.role.display_name), desc]
         if p.role == Role.MAFIA:
-            teammates = [
-                q.name for qid, q in self.players.items()
-                if q.role == Role.MAFIA and qid != user_id
-            ]
-            if teammates:
-                lines.append(f"\n🤝 Your Mafia partners: <b>{', '.join(teammates)}</b>")
-
+            mates = [q.name for qid, q in self.players.items()
+                     if q.role == Role.MAFIA and qid != user_id]
+            if mates:
+                lines.append(f"\n🤝 Hamkorlar: <b>{', '.join(mates)}</b>")
+        if p.role == Role.SERIAL_KILLER:
+            lines.append("\n⚔️ Mafiya sizi o'ldira olmaydi!")
         return "\n".join(lines)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# GameRegistry — manages one GameManager per chat
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# Registry
+# ══════════════════════════════════════════════════════════════════
 
 class GameRegistry:
-    def __init__(self) -> None:
+    def __init__(self):
         self._games: dict[int, GameManager] = {}
 
     def get(self, chat_id: int) -> Optional[GameManager]:
         return self._games.get(chat_id)
 
-    def create(self, chat_id: int, send_fn: SendFn, db) -> GameManager:
-        gm = GameManager(chat_id=chat_id, send_fn=send_fn, db=db)
+    def create(self, chat_id: int, send_fn: SendFn, db, lang: str = "uz") -> GameManager:
+        gm = GameManager(chat_id, send_fn, db, lang)
         self._games[chat_id] = gm
         return gm
 
@@ -614,6 +715,12 @@ class GameRegistry:
         for cid in ended:
             del self._games[cid]
         return len(ended)
+
+    def find_game_for_user(self, user_id: int) -> Optional[GameManager]:
+        for gm in self._games.values():
+            if user_id in gm.players:
+                return gm
+        return None
 
     def active_count(self) -> int:
         return len(self._games)
